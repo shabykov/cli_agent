@@ -1,8 +1,12 @@
-from mcp.server.fastmcp import FastMCP
-from mcp.server.fastmcp.prompts import base
+import re
+from typing import Annotated
+
+from mcp.server.mcpserver import MCPServer, Context, Resolve, Sample
+from mcp.server.mcpserver.prompts import base
+from mcp.types import CreateMessageResult, SamplingMessage, TextContent
 from pydantic import Field
 
-mcp = FastMCP("DocumentMCP", log_level="ERROR")
+mcp = MCPServer("DocumentMCP", log_level="ERROR")
 
 docs = {
     "deposition.md": "This deposition covers the testimony of Angela Smith, P.E.",
@@ -88,7 +92,95 @@ def format_document(
         base.UserMessage(prompt)
     ]
 
-# TODO: Write a prompt to summarize a doc
+
+def sampling_request(prompt: str) -> Sample:
+    return Sample(
+        messages=[
+            SamplingMessage(
+                role="user",
+                content=TextContent(type="text", text=prompt)
+            )
+        ],
+        max_tokens=4000,
+        system_prompt="You are a helpful research assistant.",
+    )
+
+
+def sampled_text(result: CreateMessageResult) -> str:
+    if result.content.type == "text":
+        return result.content.text
+    else:
+        raise ValueError("Sampling failed")
+
+
+# resolver: runs before the tool body, the framework sends the Sample to the client
+async def request_summary(text_to_summarize: str, ctx: Context) -> Sample:
+    await ctx.report_progress(10, 100, "About to do summarize...")
+    return sampling_request(f"""
+        Please summarize the following text:
+        {text_to_summarize}
+    """)
+
+
+@mcp.tool(
+    name="summarize",
+    description="Read the contents of a document and summarize and return it as a string."
+)
+async def summarize(
+        summary: Annotated[CreateMessageResult, Resolve(request_summary)],
+        text_to_summarize: str = Field(description="Text of the document"),
+        *,
+        ctx: Context
+):
+    await ctx.report_progress(90, 100, "Writing summary...")
+    return sampled_text(summary)
+
+
+# resolver: searches the docs and asks the client to write a report, None if nothing found
+async def request_report(topic: str, ctx: Context) -> Sample | None:
+    await ctx.report_progress(20, 100, "About to do research...")
+    sources = await do_research(topic)
+    if not sources:
+        return None
+
+    sources_text = "\n".join(f"- {source}" for source in sources)
+    return sampling_request(f"""
+        Write a short research report on the topic: {topic}
+        Base it on the following sources:
+        {sources_text}
+    """)
+
+
+@mcp.tool(
+    name="research",
+    description="Research a given topic"
+)
+async def research(
+        report: Annotated[CreateMessageResult | None, Resolve(request_report)],
+        topic: str = Field(description="Topic to research"),
+        *,
+        context: Context
+):
+    await context.report_progress(70, 100, "Writing report...")
+    if report is None:
+        return f"No documents found for topic: {topic}"
+
+    return sampled_text(report)
+
+
+# search docs by keywords from the topic, most relevant first
+async def do_research(topic: str) -> list[str]:
+    keywords = {word for word in re.findall(r"\w+", topic.lower()) if len(word) >= 3}
+
+    scored = []
+    for doc_id, content in docs.items():
+        text = f"{doc_id} {content}".lower()
+        score = sum(1 for keyword in keywords if keyword in text)
+        if score > 0:
+            scored.append((score, f"{doc_id}: {content}"))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [source for _, source in scored]
 
 
 if __name__ == "__main__":
